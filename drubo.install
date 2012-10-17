@@ -1,0 +1,70 @@
+<?php
+
+/**
+ * @file
+ * Install, update and uninstall functions for the drubo module.
+ */
+
+/**
+ * Implementation of hook_schema().
+ */
+function drubo_schema() {
+  $schema['drubo'] = array(
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => true,
+        'not null' => true,
+        'default' => 0,
+      ),
+      'weibo_id' => array(
+        'type' => 'int',
+        'unsigned' => true,
+        'not null' => true,
+        'default' => 0,
+      ),
+      'oauth_token' => array(
+        'type' => 'varchar',
+        'length' => 32,
+      ),
+      'oauth_token_secret' => array(
+        'type' => 'varchar',
+        'length' => 32,
+      ),
+    ),
+    'primary key' => array('uid'),
+  );
+
+  return $schema;
+}
+
+/**
+ * Implementation of hook_install().
+ */
+function drubo_install() {
+  drupal_install_schema('drubo');
+}
+
+/**
+ * Implementation of hook_uninstall().
+ */
+function drubo_uninstall() {
+  drupal_uninstall_schema('drubo');
+  db_query("DELETE FROM {variable} WHERE name LIKE 'drubo_%'");
+  cache_clear_all('variables', 'cache');
+}
+
+/**
+ * Implement of hook_requirements().
+ */
+function drubo_requirements($phase) {
+  $requirements = array();
+
+  if (!function_exists('json_decode') || !function_exists('curl_init')) {
+    $requirements['php']['description'] = t('you must enable json and curl extensions.');
+    $requirements['php']['severity'] = REQUIREMENT_ERROR;
+  }
+
+  return $requirements;
+}
+

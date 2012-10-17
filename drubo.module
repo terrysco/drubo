@@ -1,0 +1,288 @@
+<?php
+
+/**
+ * @file
+ * Allow users to post tweets through sina weibo.
+ */
+define('DRUBO_DEFAULT_API_KEY', '3023285787');
+define('DRUBO_DEFAULT_API_SECRET', '844bd648e30f6c71a1a656559a170a47');
+
+/**
+ * Implementation of hook_perm().
+ */
+function drubo_perm() {
+  return array('post tweets');
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function drubo_menu() {
+  $items['drubo/login'] = array(
+    'page callback' => 'drubo_login',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+    'file' => 'drubo.sdk.inc',
+  );
+  $items['admin/settings/drubo'] = array(
+    'title' => 'Drubo Settings',
+    'description' => 'drubo module configurations',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('drubo_admin_form'),
+    'access arguments' => array('administer site configuration'),
+    'file' => 'drubo.admin.inc',
+  );
+  $items['user/%user/drubo'] = array(
+    'title' => 'Drubo',
+    'page callback' => 'drubo_profile_page',
+    'page arguments' => array(1),
+    'access callback' => 'drubo_profile_access',
+    'access arguments' => array(1),
+    'type' => MENU_LOCAL_TASK,
+    'weight' => 10,
+    'file' => 'drubo.pages.inc',
+  );
+  return $items;
+}
+
+/**
+ * Implementation of hook_form_alter().
+ */
+function drubo_form_alter(&$form, &$form_state, $form_id) {
+  if ('user_login_block' == $form_id || 'user_login' == $form_id) {
+    $form['drubo'] = array(
+      '#access' => variable_get('user_register', 1),
+      '#value' => l(t('Login with weibo'), 'drubo/login'),
+      '#weight' => 10,
+    );
+  }
+
+  if (isset($form['type']) && isset($form['#node'])) {
+    $node = $form['#node'];
+    if ($form['type']['#value'] .'_node_form' == $form_id && in_array($node->type, variable_get('drubo_node_types', array('page')))) {
+      $form['drubo'] = array(
+        '#type' => 'checkbox',
+        '#access' => user_access('post tweets') && drubo_load($GLOBALS['user']->uid),
+        '#title' => t('Post to your sina weibo?'),
+        '#weight' => -10,
+        '#return_value' => 1,
+      );
+    }
+  }
+}
+
+/**
+ * Implementation of hook_user().
+ */
+function drubo_user($op, &$edit, &$account, $category = NULL) {
+  switch ($op) {
+    case 'delete':
+      db_query('DELETE FROM {drubo} WHERE uid = %d', $account->uid);
+      break;
+  }
+}
+
+/**
+ * Retrieve sina weibo information and let user login the system.
+ * @global object $user
+ */
+function drubo_login() {
+  global $user;
+
+  // redirect the user to sina weibo authentication page.
+  $access_token = drubo_get_access_token(url('drubo/login', array('absolute' => true)));
+
+  $c = new WeiboClient(DRUBO_DEFAULT_API_KEY, DRUBO_DEFAULT_API_SECRET, $access_token['oauth_token'], $access_token['oauth_token_secret']);
+  $info = $c->verify_credentials();
+
+  $bind_uid = db_result(db_query('SELECT uid FROM {drubo} WHERE weibo_id = %d', $access_token['user_id']));
+
+  // if current user binded a sina weibo account before,
+  // we will buzz him in.
+  if ($bind_uid) {
+    user_external_login(user_load($bind_uid));
+    drupal_goto('user/'.$bind_uid);
+  }
+  elseif ($user->uid == 0) {
+    // if the current user is an anyonmous user and he didn't bind his sina weibo account,
+    // generally we create a new user for him.
+    $account = _drubo_create_user($info);
+    db_query("INSERT INTO {drubo} (uid, weibo_id, oauth_token, oauth_token_secret)
+            VALUES (%d, %d, '%s', '%s')", $account->uid, $access_token['user_id'], $access_token['oauth_token'],
+            $access_token['oauth_token_secret']);
+    user_external_login($account);
+    drupal_set_message(t('Login through sina weibo successfully!<br />Please complete your login details.'));
+    drupal_goto('user/'.$account->uid.'/edit');
+  }
+  else {
+    db_query("INSERT INTO {drubo} (uid, weibo_id, oauth_token, oauth_token_secret)
+            VALUES (%d, %d, '%s', '%s')", $user->uid, $access_token['user_id'], $access_token['oauth_token'],
+            $access_token['oauth_token_secret']);
+    drupal_goto('user/'.$user->uid);
+  }
+}
+
+/**
+ * Get the access token.
+ * @param type $callback
+ * @return type
+ */
+function drubo_get_access_token($callback) {
+  if (isset($_REQUEST['oauth_token'])) {
+    $o = new WeiboOAuth(DRUBO_DEFAULT_API_KEY, DRUBO_DEFAULT_API_SECRET,
+            $_SESSION['drubo']['oauth_token'], $_SESSION['drubo']['oauth_token_secret']);
+    $access_token = $o->getAccessToken($_REQUEST['oauth_verifier']);
+    unset($_SESSION['drubo']);
+    return $access_token;
+  }
+  else {
+    $o = new WeiboOAuth(DRUBO_DEFAULT_API_KEY, DRUBO_DEFAULT_API_SECRET);
+    $request_token = $o->getRequestToken();
+    $_SESSION['drubo'] = $request_token;
+    $url = $o->getAuthorizeURL($request_token, false, $callback);
+    drupal_goto($url);
+  }
+}
+
+/**
+ * Implementation of hook_block().
+ */
+function drubo_block($op = 'list', $delta = 0, $edit = array()) {
+  switch ($op) {
+    case 'list':
+      $blocks[0]['info'] = t('My weibo tweets');
+      return $blocks;
+    case 'view':
+      global $user;
+      $block['title'] = t('Tweets');
+      $block['content'] = '';
+      if ($drubo = drubo_load($user->uid)) {
+        module_load_include('inc', 'drubo', 'drubo.sdk');
+        $c = new WeiboClient(DRUBO_DEFAULT_API_KEY, DRUBO_DEFAULT_API_SECRET, $drubo->oauth_token, $drubo->oauth_token_secret);
+        if ($info = $c->user_timeline(1, variable_get('drubo_profile_num', 3))) {
+          if (isset($info['error_code'])) {
+            drupal_set_message($info['error'], 'error');
+          }
+          else {
+            $block['content'] = theme('drubo_tweets', $info);
+          }
+        }
+      }
+      return $block;
+  }
+}
+
+/**
+ * Implementation of hook_theme().
+ */
+function drubo_theme() {
+  return array(
+    'drubo_tweets' => array(
+      'arguments' => array('info' => null),
+    ),
+    'drubo_profile' => array(
+      'template' => 'drubo_profile',
+      'arguments' => array('info' => null),
+    ),
+  );
+}
+
+/**
+ * display the tweets.
+ */
+function theme_drubo_tweets($info) {
+  $output = '';
+  foreach ($info as $tweet) {
+    $output .= '<div class="drubo_content">'._drubo_tweet_replace_topic($tweet['text']);
+    if (isset($tweet['thumbnail_pic'])) {
+      $output .= '<span><a href="'.$tweet['original_pic'].'"><img src="'.$tweet['thumbnail_pic'].'" /></span>';
+    }
+
+    if (isset($tweet['retweeted_status'])) {
+      $output .= '<div class="club-transfer-weibo-content" >'._drubo_tweet_replace_topic($tweet['retweeted_status']['text']).'</div>';
+      if (isset($tweet['retweeted_status']['thumbnail_pic'])) {
+        $output .= '<span><a href="'.$tweet['retweeted_status']['original_pic'].'"><img src="'.$tweet['retweeted_status']['thumbnail_pic'].'" /></a></span>';
+      }
+    }
+    $output .= '<p>Source： '. $tweet['source'] .'</p></div>';
+  }
+  return $output;
+}
+
+/**
+ * Add links to the content of tweet.
+ */
+function _drubo_tweet_replace_topic($text) {
+  $text = preg_replace('/http:\/\/[^\s"]+/', '<a href="\0" target="_blank">\0</a>', $text);
+  return preg_replace('/#([^#]+)#/', '<a href="http://weibo.com/k/\1" target="_blank">#\1#</a>', $text);
+}
+
+/**
+ * if the user is not logged in, we create a new drupal account for him.
+ */
+function _drubo_create_user($info) {
+  $name = $info['name'];
+  $i = 0;
+  while ($account = user_load(array('name' => $name))) {
+    $name = $info['name'].'_'.++$i;
+  }
+
+  $data = array(
+    'name' => $name,
+    'mail' => $name.'@weibo.com',
+    'status' => 1,
+  );
+  if (variable_get('user_pictures', 0)) {
+    $data['weibo_avatar'] = $info['profile_image_url'];
+  }
+  return user_save('', $data);
+}
+
+/**
+ * Load the drubo database object.
+ */
+function drubo_load($uid) {
+  static $drubos = array();
+  if (!isset($drubos[$uid])) {
+    $drubos[$uid] = db_fetch_object(db_query('SELECT * FROM {drubo} WHERE uid = %d', $GLOBALS['user']->uid));
+  }
+  return $drubos[$uid];
+}
+
+/**
+ * We can only see a user's drubo profile once he has bind the weibo account.
+ */
+function drubo_profile_access($account) {
+  return drubo_load($account->uid) ? TRUE : FALSE;
+}
+
+/**
+ * Implementation of hook_nodeapi().
+ */
+function drubo_nodeapi(&$node, $op, $teaser, $page) {
+  switch ($op) {
+    case 'insert':
+    case 'update':
+      if ($node->drubo) {
+        drubo_post_tweet($node);
+      }
+      break;
+    case 'default':
+      break;
+  }
+}
+
+/**
+ * Post a tweet.
+ * @global user $user
+ * @param string $content
+ */
+function drubo_post_tweet($content) {
+  global $user;
+  if ($drubo = drubo_load($user->uid)) {
+    module_load_include('inc', 'drubo', 'drubo.sdk');
+    $c = new WeiboClient(DRUBO_DEFAULT_API_KEY, DRUBO_DEFAULT_API_SECRET, $drubo->oauth_token, $drubo->oauth_token_secret);
+    $c->update($content);
+  }
+}
+

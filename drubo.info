@@ -1,0 +1,4 @@
+name = drubo
+description = posting tweets through sina weibo
+core = 6.x
+
